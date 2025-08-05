@@ -491,6 +491,32 @@
 (define-constant ERR-TRANSACTION-NOT-FOUND (err u110))
 (define-constant ERR-INVALID-STATUS (err u111))
 
+(define-map product-reviews
+    {
+        token-id: uint,
+        reviewer: principal,
+    }
+    {
+        rating: uint,
+        review-text: (string-ascii 500),
+        review-date: uint,
+        verified-purchase: bool,
+    }
+)
+
+(define-map product-ratings-summary
+    { token-id: uint }
+    {
+        total-reviews: uint,
+        average-rating: uint,
+        rating-sum: uint,
+    }
+)
+
+(define-constant ERR-ALREADY-REVIEWED (err u112))
+(define-constant ERR-INVALID-RATING (err u113))
+(define-constant ERR-NO-PURCHASE-FOUND (err u114))
+
 (define-public (list-receipt-for-sale
         (token-id uint)
         (price uint)
@@ -660,5 +686,76 @@
             (ok true)
         )
         ERR-TRANSACTION-NOT-FOUND
+    )
+)
+
+(define-public (submit-product-review
+        (token-id uint)
+        (rating uint)
+        (review-text (string-ascii 500))
+    )
+    (match (map-get? receipts { token-id: token-id })
+        receipt-data (begin
+            (asserts! (is-eq tx-sender (get customer receipt-data)) ERR-NOT-OWNER)
+            (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+            (asserts! (> (len review-text) u0) ERR-INVALID-INPUT)
+            (asserts!
+                (is-none (map-get? product-reviews {
+                    token-id: token-id,
+                    reviewer: tx-sender,
+                }))
+                ERR-ALREADY-REVIEWED
+            )
+            (map-set product-reviews {
+                token-id: token-id,
+                reviewer: tx-sender,
+            } {
+                rating: rating,
+                review-text: review-text,
+                review-date: stacks-block-height,
+                verified-purchase: true,
+            })
+            (match (map-get? product-ratings-summary { token-id: token-id })
+                summary (let (
+                        (new-total (+ (get total-reviews summary) u1))
+                        (new-sum (+ (get rating-sum summary) rating))
+                        (new-average (/ new-sum new-total))
+                    )
+                    (map-set product-ratings-summary { token-id: token-id } {
+                        total-reviews: new-total,
+                        average-rating: new-average,
+                        rating-sum: new-sum,
+                    })
+                )
+                (map-set product-ratings-summary { token-id: token-id } {
+                    total-reviews: u1,
+                    average-rating: rating,
+                    rating-sum: rating,
+                })
+            )
+            (ok true)
+        )
+        ERR-NOT-FOUND
+    )
+)
+
+(define-read-only (get-product-review
+        (token-id uint)
+        (reviewer principal)
+    )
+    (map-get? product-reviews {
+        token-id: token-id,
+        reviewer: reviewer,
+    })
+)
+
+(define-read-only (get-product-rating-summary (token-id uint))
+    (map-get? product-ratings-summary { token-id: token-id })
+)
+
+(define-read-only (get-product-average-rating (token-id uint))
+    (match (map-get? product-ratings-summary { token-id: token-id })
+        summary (ok (get average-rating summary))
+        (ok u0)
     )
 )
