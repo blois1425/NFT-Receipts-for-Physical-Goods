@@ -170,6 +170,7 @@
             )
             true
         )
+        (update-customer-loyalty-points tx-sender customer purchase-price)
         (ok token-id)
     )
 )
@@ -758,4 +759,291 @@
         summary (ok (get average-rating summary))
         (ok u0)
     )
+)
+
+(define-map customer-loyalty-points
+    {
+        retailer: principal,
+        customer: principal,
+    }
+    {
+        total-points: uint,
+        points-earned: uint,
+        points-redeemed: uint,
+        tier-level: uint,
+        last-purchase-block: uint,
+    }
+)
+
+(define-map loyalty-program-config
+    { retailer: principal }
+    {
+        points-per-unit: uint,
+        tier-1-threshold: uint,
+        tier-2-threshold: uint,
+        tier-3-threshold: uint,
+        tier-1-multiplier: uint,
+        tier-2-multiplier: uint,
+        tier-3-multiplier: uint,
+        is-active: bool,
+    }
+)
+
+(define-map point-redemptions
+    {
+        retailer: principal,
+        customer: principal,
+        redemption-id: uint,
+    }
+    {
+        points-used: uint,
+        discount-amount: uint,
+        redeemed-at: uint,
+        token-id: uint,
+    }
+)
+
+(define-data-var last-redemption-id uint u0)
+
+(define-constant ERR-LOYALTY-NOT-CONFIGURED (err u115))
+(define-constant ERR-INSUFFICIENT-POINTS (err u116))
+(define-constant ERR-INVALID-TIER (err u117))
+
+(define-public (configure-loyalty-program
+        (points-per-unit uint)
+        (tier-1-threshold uint)
+        (tier-2-threshold uint)
+        (tier-3-threshold uint)
+        (tier-1-multiplier uint)
+        (tier-2-multiplier uint)
+        (tier-3-multiplier uint)
+    )
+    (begin
+        (asserts! (is-authorized-retailer tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (> points-per-unit u0) ERR-INVALID-INPUT)
+        (asserts! (< tier-1-threshold tier-2-threshold) ERR-INVALID-INPUT)
+        (asserts! (< tier-2-threshold tier-3-threshold) ERR-INVALID-INPUT)
+        (asserts! (>= tier-1-multiplier u100) ERR-INVALID-INPUT)
+        (asserts! (>= tier-2-multiplier tier-1-multiplier) ERR-INVALID-INPUT)
+        (asserts! (>= tier-3-multiplier tier-2-multiplier) ERR-INVALID-INPUT)
+        (map-set loyalty-program-config { retailer: tx-sender } {
+            points-per-unit: points-per-unit,
+            tier-1-threshold: tier-1-threshold,
+            tier-2-threshold: tier-2-threshold,
+            tier-3-threshold: tier-3-threshold,
+            tier-1-multiplier: tier-1-multiplier,
+            tier-2-multiplier: tier-2-multiplier,
+            tier-3-multiplier: tier-3-multiplier,
+            is-active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (redeem-loyalty-points
+        (retailer principal)
+        (points-to-redeem uint)
+        (token-id uint)
+    )
+    (let ((redemption-id (+ (var-get last-redemption-id) u1)))
+        (match (map-get? loyalty-program-config { retailer: retailer })
+            config (match (map-get? customer-loyalty-points {
+                retailer: retailer,
+                customer: tx-sender,
+            })
+                loyalty-data (match (map-get? receipts { token-id: token-id })
+                    receipt-data (begin
+                        (asserts! (get is-active config)
+                            ERR-LOYALTY-NOT-CONFIGURED
+                        )
+                        (asserts! (is-eq tx-sender (get customer receipt-data))
+                            ERR-NOT-OWNER
+                        )
+                        (asserts! (is-eq retailer (get retailer receipt-data))
+                            ERR-NOT-AUTHORIZED
+                        )
+                        (asserts!
+                            (>= (get total-points loyalty-data) points-to-redeem)
+                            ERR-INSUFFICIENT-POINTS
+                        )
+                        (asserts! (> points-to-redeem u0) ERR-INVALID-INPUT)
+                        (let (
+                                (discount-amount (/
+                                    (* points-to-redeem
+                                        (get purchase-price receipt-data)
+                                    )
+                                    u1000
+                                ))
+                                (new-total-points (- (get total-points loyalty-data)
+                                    points-to-redeem
+                                ))
+                                (new-redeemed-points (+ (get points-redeemed loyalty-data)
+                                    points-to-redeem
+                                ))
+                            )
+                            (map-set customer-loyalty-points {
+                                retailer: retailer,
+                                customer: tx-sender,
+                            }
+                                (merge loyalty-data {
+                                    total-points: new-total-points,
+                                    points-redeemed: new-redeemed-points,
+                                })
+                            )
+                            (map-set point-redemptions {
+                                retailer: retailer,
+                                customer: tx-sender,
+                                redemption-id: redemption-id,
+                            } {
+                                points-used: points-to-redeem,
+                                discount-amount: discount-amount,
+                                redeemed-at: stacks-block-height,
+                                token-id: token-id,
+                            })
+                            (var-set last-redemption-id redemption-id)
+                            (ok discount-amount)
+                        )
+                    )
+                    ERR-NOT-FOUND
+                )
+                ERR-NOT-FOUND
+            )
+            ERR-LOYALTY-NOT-CONFIGURED
+        )
+    )
+)
+
+(define-private (calculate-tier-level
+        (total-points uint)
+        (config {
+            points-per-unit: uint,
+            tier-1-threshold: uint,
+            tier-2-threshold: uint,
+            tier-3-threshold: uint,
+            tier-1-multiplier: uint,
+            tier-2-multiplier: uint,
+            tier-3-multiplier: uint,
+            is-active: bool,
+        })
+    )
+    (if (>= total-points (get tier-3-threshold config))
+        u3
+        (if (>= total-points (get tier-2-threshold config))
+            u2
+            (if (>= total-points (get tier-1-threshold config))
+                u1
+                u0
+            )
+        )
+    )
+)
+
+(define-private (calculate-points-earned
+        (purchase-amount uint)
+        (tier-level uint)
+        (config {
+            points-per-unit: uint,
+            tier-1-threshold: uint,
+            tier-2-threshold: uint,
+            tier-3-threshold: uint,
+            tier-1-multiplier: uint,
+            tier-2-multiplier: uint,
+            tier-3-multiplier: uint,
+            is-active: bool,
+        })
+    )
+    (let ((base-points (/ (* purchase-amount (get points-per-unit config)) u100)))
+        (if (is-eq tier-level u3)
+            (/ (* base-points (get tier-3-multiplier config)) u100)
+            (if (is-eq tier-level u2)
+                (/ (* base-points (get tier-2-multiplier config)) u100)
+                (if (is-eq tier-level u1)
+                    (/ (* base-points (get tier-1-multiplier config)) u100)
+                    base-points
+                )
+            )
+        )
+    )
+)
+
+(define-private (update-customer-loyalty-points
+        (retailer principal)
+        (customer principal)
+        (purchase-amount uint)
+    )
+    (match (map-get? loyalty-program-config { retailer: retailer })
+        config (if (get is-active config)
+            (match (map-get? customer-loyalty-points {
+                retailer: retailer,
+                customer: customer,
+            })
+                existing-loyalty (let (
+                        (current-tier (calculate-tier-level (get total-points existing-loyalty)
+                            config
+                        ))
+                        (points-to-add (calculate-points-earned purchase-amount current-tier
+                            config
+                        ))
+                        (new-total-points (+ (get total-points existing-loyalty) points-to-add))
+                        (new-tier (calculate-tier-level new-total-points config))
+                    )
+                    (map-set customer-loyalty-points {
+                        retailer: retailer,
+                        customer: customer,
+                    } {
+                        total-points: new-total-points,
+                        points-earned: (+ (get points-earned existing-loyalty) points-to-add),
+                        points-redeemed: (get points-redeemed existing-loyalty),
+                        tier-level: new-tier,
+                        last-purchase-block: stacks-block-height,
+                    })
+                    true
+                )
+                (let (
+                        (points-to-add (calculate-points-earned purchase-amount u0 config))
+                        (new-tier (calculate-tier-level points-to-add config))
+                    )
+                    (map-set customer-loyalty-points {
+                        retailer: retailer,
+                        customer: customer,
+                    } {
+                        total-points: points-to-add,
+                        points-earned: points-to-add,
+                        points-redeemed: u0,
+                        tier-level: new-tier,
+                        last-purchase-block: stacks-block-height,
+                    })
+                    true
+                )
+            )
+            true
+        )
+        true
+    )
+)
+
+(define-read-only (get-customer-loyalty-status
+        (retailer principal)
+        (customer principal)
+    )
+    (map-get? customer-loyalty-points {
+        retailer: retailer,
+        customer: customer,
+    })
+)
+
+(define-read-only (get-loyalty-program-config (retailer principal))
+    (map-get? loyalty-program-config { retailer: retailer })
+)
+
+(define-read-only (get-redemption-history
+        (retailer principal)
+        (customer principal)
+        (redemption-id uint)
+    )
+    (map-get? point-redemptions {
+        retailer: retailer,
+        customer: customer,
+        redemption-id: redemption-id,
+    })
 )
