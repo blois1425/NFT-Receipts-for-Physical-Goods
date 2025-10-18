@@ -1047,3 +1047,305 @@
         redemption-id: redemption-id,
     })
 )
+
+(define-map disputes
+    { dispute-id: uint }
+    {
+        token-id: uint,
+        customer: principal,
+        retailer: principal,
+        dispute-type: (string-ascii 50),
+        description: (string-ascii 500),
+        filed-at: uint,
+        status: (string-ascii 30),
+        arbitrator: (optional principal),
+        customer-evidence: (optional (string-ascii 500)),
+        retailer-response: (optional (string-ascii 500)),
+        resolution: (optional (string-ascii 500)),
+        resolved-at: (optional uint),
+        winner: (optional (string-ascii 20)),
+    }
+)
+
+(define-map arbitrators
+    principal
+    {
+        is-active: bool,
+        total-cases: uint,
+        successful-resolutions: uint,
+        reputation: uint,
+    }
+)
+
+(define-map arbitrator-assignments
+    { dispute-id: uint }
+    {
+        arbitrator: principal,
+        assigned-at: uint,
+        accepted: bool,
+    }
+)
+
+(define-data-var last-dispute-id uint u0)
+
+(define-constant ERR-DISPUTE-NOT-FOUND (err u118))
+(define-constant ERR-NOT-ARBITRATOR (err u119))
+(define-constant ERR-DISPUTE-ALREADY-RESOLVED (err u120))
+(define-constant ERR-NOT-DISPUTE-PARTY (err u121))
+(define-constant ERR-ARBITRATOR-NOT-ASSIGNED (err u122))
+
+(define-public (register-arbitrator)
+    (begin
+        (map-set arbitrators tx-sender {
+            is-active: true,
+            total-cases: u0,
+            successful-resolutions: u0,
+            reputation: u100,
+        })
+        (ok true)
+    )
+)
+
+(define-public (file-dispute
+        (token-id uint)
+        (dispute-type (string-ascii 50))
+        (description (string-ascii 500))
+    )
+    (let ((dispute-id (+ (var-get last-dispute-id) u1)))
+        (match (map-get? receipts { token-id: token-id })
+            receipt-data (begin
+                (asserts! (is-eq tx-sender (get customer receipt-data))
+                    ERR-NOT-OWNER
+                )
+                (asserts! (> (len dispute-type) u0) ERR-INVALID-INPUT)
+                (asserts! (> (len description) u0) ERR-INVALID-INPUT)
+                (map-set disputes { dispute-id: dispute-id } {
+                    token-id: token-id,
+                    customer: tx-sender,
+                    retailer: (get retailer receipt-data),
+                    dispute-type: dispute-type,
+                    description: description,
+                    filed-at: stacks-block-height,
+                    status: "open",
+                    arbitrator: none,
+                    customer-evidence: none,
+                    retailer-response: none,
+                    resolution: none,
+                    resolved-at: none,
+                    winner: none,
+                })
+                (var-set last-dispute-id dispute-id)
+                (ok dispute-id)
+            )
+            ERR-NOT-FOUND
+        )
+    )
+)
+
+(define-public (respond-to-dispute
+        (dispute-id uint)
+        (response (string-ascii 500))
+    )
+    (match (map-get? disputes { dispute-id: dispute-id })
+        dispute-data (begin
+            (asserts! (is-eq tx-sender (get retailer dispute-data))
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts! (is-eq (get status dispute-data) "open")
+                ERR-DISPUTE-ALREADY-RESOLVED
+            )
+            (asserts! (> (len response) u0) ERR-INVALID-INPUT)
+            (map-set disputes { dispute-id: dispute-id }
+                (merge dispute-data {
+                    retailer-response: (some response),
+                    status: "responded",
+                })
+            )
+            (ok true)
+        )
+        ERR-DISPUTE-NOT-FOUND
+    )
+)
+
+(define-public (submit-customer-evidence
+        (dispute-id uint)
+        (evidence (string-ascii 500))
+    )
+    (match (map-get? disputes { dispute-id: dispute-id })
+        dispute-data (begin
+            (asserts! (is-eq tx-sender (get customer dispute-data))
+                ERR-NOT-AUTHORIZED
+            )
+            (asserts!
+                (or
+                    (is-eq (get status dispute-data) "open")
+                    (is-eq (get status dispute-data) "responded")
+                )
+                ERR-DISPUTE-ALREADY-RESOLVED
+            )
+            (asserts! (> (len evidence) u0) ERR-INVALID-INPUT)
+            (map-set disputes { dispute-id: dispute-id }
+                (merge dispute-data { customer-evidence: (some evidence) })
+            )
+            (ok true)
+        )
+        ERR-DISPUTE-NOT-FOUND
+    )
+)
+
+(define-public (request-arbitration (dispute-id uint))
+    (match (map-get? disputes { dispute-id: dispute-id })
+        dispute-data (begin
+            (asserts!
+                (or
+                    (is-eq tx-sender (get customer dispute-data))
+                    (is-eq tx-sender (get retailer dispute-data))
+                )
+                ERR-NOT-DISPUTE-PARTY
+            )
+            (asserts!
+                (or
+                    (is-eq (get status dispute-data) "open")
+                    (is-eq (get status dispute-data) "responded")
+                )
+                ERR-DISPUTE-ALREADY-RESOLVED
+            )
+            (map-set disputes { dispute-id: dispute-id }
+                (merge dispute-data { status: "arbitration-requested" })
+            )
+            (ok true)
+        )
+        ERR-DISPUTE-NOT-FOUND
+    )
+)
+
+(define-public (accept-arbitration (dispute-id uint))
+    (match (map-get? disputes { dispute-id: dispute-id })
+        dispute-data (match (map-get? arbitrators tx-sender)
+            arbitrator-data (begin
+                (asserts! (get is-active arbitrator-data) ERR-NOT-ARBITRATOR)
+                (asserts!
+                    (is-eq (get status dispute-data) "arbitration-requested")
+                    ERR-INVALID-STATUS
+                )
+                (map-set arbitrator-assignments { dispute-id: dispute-id } {
+                    arbitrator: tx-sender,
+                    assigned-at: stacks-block-height,
+                    accepted: true,
+                })
+                (map-set disputes { dispute-id: dispute-id }
+                    (merge dispute-data {
+                        status: "in-arbitration",
+                        arbitrator: (some tx-sender),
+                    })
+                )
+                (map-set arbitrators tx-sender
+                    (merge arbitrator-data { total-cases: (+ (get total-cases arbitrator-data) u1) })
+                )
+                (ok true)
+            )
+            ERR-NOT-ARBITRATOR
+        )
+        ERR-DISPUTE-NOT-FOUND
+    )
+)
+
+(define-public (resolve-dispute
+        (dispute-id uint)
+        (resolution (string-ascii 500))
+        (winner (string-ascii 20))
+    )
+    (match (map-get? disputes { dispute-id: dispute-id })
+        dispute-data (begin
+            (asserts! (> (len resolution) u0) ERR-INVALID-INPUT)
+            (asserts! (> (len winner) u0) ERR-INVALID-INPUT)
+            (asserts! (is-eq (get status dispute-data) "in-arbitration")
+                ERR-INVALID-STATUS
+            )
+            (match (get arbitrator dispute-data)
+                assigned-arbitrator (begin
+                    (asserts! (is-eq tx-sender assigned-arbitrator)
+                        ERR-NOT-ARBITRATOR
+                    )
+                    (map-set disputes { dispute-id: dispute-id }
+                        (merge dispute-data {
+                            status: "resolved",
+                            resolution: (some resolution),
+                            resolved-at: (some stacks-block-height),
+                            winner: (some winner),
+                        })
+                    )
+                    (match (map-get? arbitrators tx-sender)
+                        arbitrator-data (map-set arbitrators tx-sender
+                            (merge arbitrator-data { successful-resolutions: (+ (get successful-resolutions arbitrator-data) u1) })
+                        )
+                        true
+                    )
+                    (ok true)
+                )
+                ERR-ARBITRATOR-NOT-ASSIGNED
+            )
+        )
+        ERR-DISPUTE-NOT-FOUND
+    )
+)
+
+(define-public (settle-dispute-bilaterally
+        (dispute-id uint)
+        (settlement-terms (string-ascii 500))
+    )
+    (match (map-get? disputes { dispute-id: dispute-id })
+        dispute-data (begin
+            (asserts!
+                (or
+                    (is-eq tx-sender (get customer dispute-data))
+                    (is-eq tx-sender (get retailer dispute-data))
+                )
+                ERR-NOT-DISPUTE-PARTY
+            )
+            (asserts!
+                (or
+                    (is-eq (get status dispute-data) "open")
+                    (is-eq (get status dispute-data) "responded")
+                    (is-eq (get status dispute-data) "arbitration-requested")
+                )
+                ERR-DISPUTE-ALREADY-RESOLVED
+            )
+            (asserts! (> (len settlement-terms) u0) ERR-INVALID-INPUT)
+            (map-set disputes { dispute-id: dispute-id }
+                (merge dispute-data {
+                    status: "settled",
+                    resolution: (some settlement-terms),
+                    resolved-at: (some stacks-block-height),
+                    winner: (some "mutual"),
+                })
+            )
+            (ok true)
+        )
+        ERR-DISPUTE-NOT-FOUND
+    )
+)
+
+(define-read-only (get-dispute-details (dispute-id uint))
+    (map-get? disputes { dispute-id: dispute-id })
+)
+
+(define-read-only (get-arbitrator-info (arbitrator principal))
+    (map-get? arbitrators arbitrator)
+)
+
+(define-read-only (get-arbitrator-assignment (dispute-id uint))
+    (map-get? arbitrator-assignments { dispute-id: dispute-id })
+)
+
+(define-read-only (calculate-arbitrator-success-rate (arbitrator principal))
+    (match (map-get? arbitrators arbitrator)
+        arbitrator-data (if (> (get total-cases arbitrator-data) u0)
+            (ok (/ (* (get successful-resolutions arbitrator-data) u100)
+                (get total-cases arbitrator-data)
+            ))
+            (ok u0)
+        )
+        (ok u0)
+    )
+)
