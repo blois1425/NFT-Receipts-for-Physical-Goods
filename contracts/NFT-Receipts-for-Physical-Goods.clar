@@ -19,6 +19,23 @@
     }
 )
 
+(define-map ownership-history
+    {
+        token-id: uint,
+        event-index: uint,
+    }
+    {
+        owner: principal,
+        acquired-at: uint,
+        event-type: (string-ascii 20),
+    }
+)
+
+(define-map ownership-event-counters
+    { token-id: uint }
+    { event-count: uint }
+)
+
 (define-map authorized-retailers
     principal
     bool
@@ -134,6 +151,41 @@
     )
 )
 
+(define-private (record-ownership-event
+        (token-id uint)
+        (owner principal)
+        (event-type (string-ascii 20))
+    )
+    (let ((maybe-counter (map-get? ownership-event-counters { token-id: token-id })))
+        (match maybe-counter
+            counter (let ((next-index (+ (get event-count counter) u1)))
+                (map-set ownership-event-counters { token-id: token-id } { event-count: next-index })
+                (map-set ownership-history {
+                    token-id: token-id,
+                    event-index: next-index,
+                } {
+                    owner: owner,
+                    acquired-at: stacks-block-height,
+                    event-type: event-type,
+                })
+                true
+            )
+            (let ((next-index u1))
+                (map-set ownership-event-counters { token-id: token-id } { event-count: next-index })
+                (map-set ownership-history {
+                    token-id: token-id,
+                    event-index: next-index,
+                } {
+                    owner: owner,
+                    acquired-at: stacks-block-height,
+                    event-type: event-type,
+                })
+                true
+            )
+        )
+    )
+)
+
 (define-public (issue-receipt
         (customer principal)
         (product-name (string-ascii 100))
@@ -163,6 +215,7 @@
             is-transferable: is-transferable,
             metadata-uri: metadata-uri,
         })
+        (record-ownership-event token-id customer "mint")
         (var-set last-token-id token-id)
         (match (map-get? retailer-profiles { retailer: tx-sender })
             profile (map-set retailer-profiles { retailer: tx-sender }
@@ -188,6 +241,7 @@
             (map-set receipts { token-id: token-id }
                 (merge receipt-data { customer: recipient })
             )
+            (record-ownership-event token-id recipient "transfer")
             (ok true)
         )
         ERR-NOT-FOUND
@@ -393,6 +447,7 @@
                 is-transferable: (get is-transferable receipt-data),
                 metadata-uri: (get metadata-uri receipt-data),
             })
+            (record-ownership-event token-id (get customer receipt-data) "mint")
             (var-set last-token-id token-id)
             (match (map-get? retailer-profiles { retailer: tx-sender })
                 profile (map-set retailer-profiles { retailer: tx-sender }
@@ -451,6 +506,9 @@
                 ))
                 (map-set receipts { token-id: (get token-id transfer-data) }
                     (merge receipt-data { customer: (get recipient transfer-data) })
+                )
+                (record-ownership-event (get token-id transfer-data)
+                    (get recipient transfer-data) "transfer"
                 )
                 (ok true)
             )
@@ -649,6 +707,9 @@
                     (merge receipt-data { customer: (get buyer transaction-data) })
                 )
                 true
+            )
+            (record-ownership-event (get token-id transaction-data)
+                (get buyer transaction-data) "market-sale"
             )
             (map-set escrow-transactions { transaction-id: transaction-id }
                 (merge transaction-data { status: "completed" })
@@ -1093,6 +1154,7 @@
 (define-constant ERR-DISPUTE-ALREADY-RESOLVED (err u120))
 (define-constant ERR-NOT-DISPUTE-PARTY (err u121))
 (define-constant ERR-ARBITRATOR-NOT-ASSIGNED (err u122))
+(define-constant ERR-OWNERSHIP-EVENT-NOT-FOUND (err u123))
 
 (define-public (register-arbitrator)
     (begin
@@ -1347,5 +1409,38 @@
             (ok u0)
         )
         (ok u0)
+    )
+)
+
+(define-read-only (get-ownership-event-count (token-id uint))
+    (match (map-get? ownership-event-counters { token-id: token-id })
+        counter (ok (get event-count counter))
+        (ok u0)
+    )
+)
+
+(define-read-only (get-ownership-event
+        (token-id uint)
+        (event-index uint)
+    )
+    (match (map-get? ownership-history {
+        token-id: token-id,
+        event-index: event-index,
+    })
+        event (ok event)
+        ERR-OWNERSHIP-EVENT-NOT-FOUND
+    )
+)
+
+(define-read-only (get-latest-ownership-event (token-id uint))
+    (match (map-get? ownership-event-counters { token-id: token-id })
+        counter (match (map-get? ownership-history {
+            token-id: token-id,
+            event-index: (get event-count counter),
+        })
+            event (ok event)
+            ERR-OWNERSHIP-EVENT-NOT-FOUND
+        )
+        ERR-OWNERSHIP-EVENT-NOT-FOUND
     )
 )
